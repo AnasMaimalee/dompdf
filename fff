@@ -1,0 +1,128 @@
+<?php
+require _DIR_ . '/vendor/autoload.php';
+
+use Swoole\Http\Server;
+use Swoole\Http\Request;
+use Swoole\Http\Response;
+use Twig\Environment;
+use Twig\Loader\FilesystemLoader;
+use Dompdf\Dompdf;
+use Endroid\QrCode\Builder\Builder;
+use Endroid\QrCode\Writer\PngWriter;
+use QuickRoute\Route;
+use QuickRoute\Router\Dispatcher;
+
+// Setup Twig
+$loader = new FilesystemLoader(_DIR_ . '/src/View');
+$twig = new Environment($loader);
+
+// Create Swoole HTTP Server
+$server = new Server("127.0.0.1", 9503);
+$server->on('start', function($server) {
+    echo "Server 127.0.0.1:9503 starting.....";
+});
+
+// Register Routes
+Route::get('/api/v1/receipts/airtime', function($params) use ($twig) {
+    return handleReceipt($params, 'airtime-receipt.twig', $twig);
+});
+
+Route::get('/api/v1/receipts/data', function($params) use ($twig) {
+    return handleReceipt($params, 'data-receipt.twig', $twig);
+});
+
+$server->on("request", function (Request $request, Response $response) {
+    // Get request method and path
+    $method = $request->server['request_method'];
+    $path = $request->server['request_uri'];
+
+    // Dispatch the route
+    $dispatcher = Dispatcher::collectRoutes()
+        ->dispatch($method, $path);
+
+    switch (true) {
+        case $dispatcher->isFound():
+            $controller = $dispatcher->getRoute()->getController();
+            // Call the route handler with the request data
+            $result = $controller([
+                'request' => $request,
+                'response' => $response,
+            ]);
+            $response->end($result);
+            break;
+
+        case $dispatcher->isNotFound():
+            $response->status(404);
+            $response->end("Page not found");
+            break;
+
+        case $dispatcher->isMethodNotAllowed():
+            $response->status(405);
+            $response->end("Request method not allowed");
+            break;
+    }
+});
+
+$server->start();
+
+// Define receipt handling logic
+function handleReceipt($params, $templateName, $twig) {
+    $request = $params['request'];
+    $response = $params['response'];
+
+    if ($request->header['content-type'] === 'application/json') {
+        $postData = json_decode($request->rawContent(), true);
+    } else {
+        $postData = $request->post;
+    }
+
+    if (!isset($postData['data'])) {
+        $response->status(400);
+        return 'Invalid request. Missing data.';
+    }
+
+    $data = is_string($postData['data']) ? json_decode($postData['data'], true) : $postData['data'];
+    $verificationUrl = $data['transaction']['verification_url'] ?? '';
+
+    try {
+        $result = Builder::create()
+            ->writer(new PngWriter())
+            ->data($verificationUrl)
+            ->size(150)
+            ->build();
+
+        $qrcodeBase64 = base64_encode($result->getString());
+        $data['qrcode_b64'] = 'data:image/png;base64,' . $qrcodeBase64;
+
+        $imagePath = 'datano_transparent.png';
+        $type = pathinfo($imagePath, PATHINFO_EXTENSION);
+        $logoData = file_get_contents($imagePath);
+        $data['logo_base64'] = 'data:image/' . $type . ';base64,' . base64_encode($logoData);
+
+        $template = $twig->load($templateName);
+        $html = $template->render($data);
+
+        $dompdf = new Dompdf();
+        $dompdf->loadHtml($html);
+        $dompdf->setPaper('A5', 'portrait');
+        $dompdf->render();
+
+        $fileName = 'receipt_' . time() . '.pdf';
+        $relativePath = 'output/' . $fileName;
+        $outputPath = _DIR_ . '/' . $relativePath;
+        file_put_contents($outputPath, $dompdf->output());
+
+        swoole_timer_after(24 * 3600 * 1000, function() use ($outputPath) {
+            if (file_exists($outputPath)) {
+                unlink($outputPath);
+            }
+        });
+
+        return json_encode(['file_path' => $relativePath], JSON_UNESCAPED_SLASHES);
+
+    } catch (Exception $e) {
+        $response->status(500);
+        return "Error: " . $e->getMessage();
+    }
+}
+?>
